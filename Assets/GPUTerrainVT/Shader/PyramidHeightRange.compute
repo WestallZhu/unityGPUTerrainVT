@@ -1,0 +1,70 @@
+
+#pragma kernel HeightRangeMip0
+#pragma kernel HeightRangeMipDown
+
+#pragma enable_d3d11_debug_symbols
+
+RWTexture2D<float2> _HeightRangeTex;
+
+//Terrain height texture array
+Texture2DArray<float> _HeightArray;
+
+groupshared float2 sharedPatchGroup[8 * 8];
+
+float4 _ThreadGroupDim;
+
+[numthreads(8,8,1)]
+void HeightRangeMip0(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
+{
+	uint3 coordIndex = uint3(id.xy*2, groupID.z);
+	float h00 = _HeightArray[coordIndex].r;
+	float h10 = _HeightArray[coordIndex + uint3(1, 0, 0)].r;
+	float h01 = _HeightArray[coordIndex + uint3(0, 1, 0)].r;
+	float h11 = _HeightArray[coordIndex + uint3(1, 1, 0)].r;
+	float hmin = min(min(h00, h10), min(h01, h11));
+	float hmax = max(max(h00, h10), max(h01, h11));
+
+	sharedPatchGroup[groupIndex] = float2(hmin,hmax);
+	GroupMemoryBarrierWithGroupSync();
+
+	uint threadCount = 8 * 8;
+
+	for (uint k = (threadCount >> 1); k > 0; k >>= 1) {
+		if (groupIndex < k)
+		{
+			sharedPatchGroup[groupIndex].x = min(sharedPatchGroup[groupIndex + k].x, sharedPatchGroup[groupIndex].x);
+			sharedPatchGroup[groupIndex].y = max(sharedPatchGroup[groupIndex + k].y, sharedPatchGroup[groupIndex].y);
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (groupIndex == 0) {
+		int3 dim = _ThreadGroupDim;
+		int dimzsqrt = sqrt(dim.z);
+		int2 index = int2(groupID.z % dimzsqrt, groupID.z / dimzsqrt);
+		_HeightRangeTex[groupID.xy + index.xy * dim.xy] = sharedPatchGroup[0].xy;
+	}
+}
+
+Texture2D<float2> _PrevMipHeight;
+RWTexture2D<float2> _HierarchicalHeight;
+SamplerState g_point_clamp_sampler;
+
+int _PyramidSize;
+
+[numthreads(8, 8, 1)]
+void HeightRangeMipDown(uint3 id : SV_DispatchThreadID)
+{
+	if (any(id.xy >= (uint)_PyramidSize))
+		return;
+	uint2 coord = id.xy * 2;
+	float2 h00 = _PrevMipHeight[coord].rg;
+	float2 h10 = _PrevMipHeight[coord + uint2(1, 0)].rg;
+	float2 h01 = _PrevMipHeight[coord + uint2(0, 1)].rg;
+	float2 h11 = _PrevMipHeight[coord + uint2(1, 1)].rg;
+
+	float hmin = min(min(h00.r, h10.r), min(h01.r, h11.r));
+	float hmax = max(max(h00.g, h10.g), max(h01.g, h11.g));
+	_HierarchicalHeight[id.xy] = float2(hmin, hmax);
+}

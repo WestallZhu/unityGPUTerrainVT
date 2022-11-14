@@ -1,0 +1,167 @@
+
+#pragma kernel CSVisitLodNode
+#pragma kernel CSBuildSectorLodTex
+#pragma kernel CSBuildPatches
+
+#pragma enable_d3d11_debug_symbols
+#include "./CommonInput.hlsl"
+
+groupshared uint nodeCounts[MAX_LOD + 1];
+groupshared uint nodeListAB[64 + 64];
+
+uniform uint _MaxLodNodeCount;
+uniform uint _MaxLodNodeStart;
+StructuredBuffer<NodeCSData> _NodeCSList;
+RWStructuredBuffer<uint3> _FinalNodeList;
+RWStructuredBuffer<uint> _IndirectArgs;
+RWStructuredBuffer<NodeRenderData> _PatchRenderList;
+
+RWStructuredBuffer<uint> _SectorIndirectArgs;
+RWStructuredBuffer<uint> _PatchIndirectArgs;
+
+uniform float3 _CameraPositionWS;
+
+uniform float3 _SceneOffset;
+uniform float _UnitMeter;
+uniform float4 _LodEvaluationCoef;
+
+
+RWStructuredBuffer<uint> _NodeLodState;
+
+RWTexture2D<float> _SectorLodTex;
+
+bool EvaluateDivideLod(NodeCSData node, uint lod)
+{
+	if (node.children == 0)
+		return false;
+	float nodeSize = exp2(lod + (10 - MAX_LOD) );
+	float3 positionWS;
+	positionWS.xz = float2(node.x, node.z) * _UnitMeter + _SceneOffset.xz + nodeSize * 0.5;
+	positionWS.y = (node.min + node.max) * 0.5;
+	float dist2cam = distance(_CameraPositionWS.xyz, positionWS.xyz);
+	if(dist2cam < nodeSize * (_LodEvaluationCoef.x /*- node.lodBias * _LodEvaluationCoef.y*/))
+		return true;
+	return false;
+}
+
+[numthreads(8,8,1)]
+void CSVisitLodNode(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
+{
+	uint maxLodNodeCount = _MaxLodNodeCount * _MaxLodNodeCount;
+	if (groupIndex == 0)
+	{
+		nodeCounts[0] = maxLodNodeCount;
+		nodeCounts[1] = 0;
+		nodeCounts[2] = 0;
+		nodeCounts[3] = 0;
+		nodeCounts[4] = 0;
+
+		_SectorIndirectArgs[0] = 0;
+	}
+	if (groupIndex < maxLodNodeCount)
+	{
+		//max lod level 4
+		nodeListAB[groupIndex] = _MaxLodNodeStart + groupIndex;
+	}
+
+	uint offset = 0;
+	uint lodNodeCount = _MaxLodNodeCount;
+
+	uint offsetSwap = 0;
+	[unroll]
+	for (uint i = 0; i <= MAX_LOD; i++)
+	{
+		AllMemoryBarrierWithGroupSync();
+
+		uint lod = MAX_LOD - i;
+		uint curNodeCount = nodeCounts[i];
+		if (groupIndex < curNodeCount)
+		{
+			uint index = nodeListAB[offsetSwap + groupIndex];
+			
+			offsetSwap = offsetSwap == 0 ? 64 : 0; // swap A B 
+
+			NodeCSData node = _NodeCSList[index];
+			int branch = 1;
+			uint thisNodeSize = exp2(lod + (10 - MAX_LOD));
+			uint2 nodeLoc = uint2(node.x, node.z) / thisNodeSize;
+
+			if (lod >1 && EvaluateDivideLod(node, lod))
+			{
+				uint addCount;
+				InterlockedAdd(nodeCounts[i+1], 4, addCount);
+				uint nextIndex = offsetSwap + addCount;
+				uint children = node.children;
+				nodeListAB[nextIndex] = children;
+				nodeListAB[nextIndex+1] = children + 1;
+				nodeListAB[nextIndex+2] = children + 2;
+				nodeListAB[nextIndex+3] = children + 3;
+			}
+			else
+			{
+				uint curIdx;
+				InterlockedAdd(_SectorIndirectArgs[0], 1, curIdx);
+				_FinalNodeList[curIdx] = uint3(node.x,node.z,lod);
+				branch = 0;
+
+				uint sectorCount = thisNodeSize / 64;
+				uint2 sectorLoc = nodeLoc * sectorCount;
+				uint wCount = sectorCount * sectorCount;
+				//[unrool(16)]
+				for (int i = 0; i < wCount; i++)
+				{
+					_SectorLodTex[sectorLoc.xy + uint2(i % sectorCount, i / sectorCount)] = lod * 1.0 / MAX_LOD;
+				}
+
+
+			} 
+
+
+			//uint nodeId = offset + nodeLoc.y * lodNodeCount + nodeLoc.x;
+
+			//_NodeLodState[nodeId] = branch;
+
+			//offset += lodNodeCount * lodNodeCount;
+			//lodNodeCount *= 2;
+
+		}
+	}
+
+}
+
+[numthreads(8,8,1)]
+void CSBuildSectorLodTex(uint3 id :SV_DispatchThreadID)
+{
+	uint2 sectorLoc = id.xy;
+	uint offset = 0;
+	uint lodNodeCount = _MaxLodNodeCount;
+
+	[unroll]
+	for (uint i = 0; i <= MAX_LOD; i++)
+	{
+		uint lod = MAX_LOD - i;
+		uint sectorCount = exp2(lod); // sector count per node in this lod
+		uint2 nodeLoc = sectorLoc / sectorCount;
+		uint nodeId = offset + nodeLoc.y * lodNodeCount + nodeLoc.x;
+
+		if (_NodeLodState[nodeId] == 0)
+		{
+			_SectorLodTex[sectorLoc] = lod * 1.0 / MAX_LOD;
+			return ;
+		}
+
+		offset += lodNodeCount * lodNodeCount;
+		lodNodeCount *= 2;
+
+		//_SectorLodTex[sectorLoc] = 0;
+	}
+
+}
+
+
+[numthreads(8, 8, 1)]
+void CSBuildPatches(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GROUPID, uint groupIndex : SV_GroupIndex)
+{
+
+}
+

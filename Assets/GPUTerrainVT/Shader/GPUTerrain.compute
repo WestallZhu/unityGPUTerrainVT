@@ -1,0 +1,282 @@
+
+#pragma kernel CSVisitLodNode
+#pragma kernel CSBuildSectorLodTex
+#pragma kernel CSBuildPatches
+
+#pragma enable_d3d11_debug_symbols
+#include "TerrainInput.hlsl"
+
+groupshared uint nodeCounts[MAX_LOD + 1];
+
+#define MAX_AB_SIZE 64u
+groupshared uint2 nodeListAB[MAX_AB_SIZE + MAX_AB_SIZE];
+
+
+uniform uint _MaxLodNodeCount;
+
+RWStructuredBuffer<uint3> _FinalNodeList;
+RWStructuredBuffer<uint> _IndirectArgs;
+RWStructuredBuffer<RenderPatch> _PatchRenderList;
+
+RWBuffer<uint> _SectorIndirectArgs;
+RWBuffer<uint> _PatchIndirectArgs;
+
+uniform float3 _CameraPositionWS;
+
+uniform float3 _SceneOffset;
+uniform float _UnitMeter;
+uniform float4 _LodEvaluationCoef;
+uniform float _TerrainHeightmapScale;
+
+//Iteration quad tree node state
+RWStructuredBuffer<uint> _NodeStateList;
+
+RWTexture2D<float> _SectorLodTex;
+
+Texture2D<float2> _HeightRangeTex;
+
+uniform float4 _Planes[6];
+uniform float3 _FrustumMinPoint;
+uniform float3 _FrustumMaxPoint;
+
+
+bool EvaluateDivideLod(uint2 node, uint lod)
+{
+	float nodeSize = exp2(lod + (10 - MAX_LOD) );
+	float3 positionWS;
+	positionWS.xz = node * nodeSize + _SceneOffset.xz + nodeSize * 0.5;
+	
+	float2 minMaxRange = _HeightRangeTex.mips[lod + 2 - log2(_UnitMeter)][node].xy;
+	positionWS.y = (minMaxRange.x + minMaxRange.y)*_TerrainHeightmapScale * 0.5 + _SceneOffset.y;
+	float dist2cam = distance(_CameraPositionWS.xyz, positionWS.xyz);
+	if(dist2cam < nodeSize * (_LodEvaluationCoef.x /*- node.lodBias * _LodEvaluationCoef.y*/))
+		return true;
+	return false;
+}
+
+// visit full quad tree. Dispatch  once
+[numthreads(8,8,1)]
+void CSVisitLodNode(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint groupIndex : SV_GroupIndex)
+{
+	uint maxLodNodeCount = _MaxLodNodeCount * _MaxLodNodeCount;
+	if (groupIndex == 0)
+	{
+		_SectorIndirectArgs[0] = 0;
+		_PatchIndirectArgs[1] = 0;
+		nodeCounts[0] = maxLodNodeCount;
+		nodeCounts[1] = 0;
+		nodeCounts[2] = 0;
+		nodeCounts[3] = 0;
+		nodeCounts[4] = 0;
+	}
+	if (groupIndex < maxLodNodeCount)
+	{
+		//max lod level 4
+		nodeListAB[groupIndex] = uint2(groupIndex % _MaxLodNodeCount, groupIndex / _MaxLodNodeCount);
+		
+	}
+
+	
+
+	uint rawNodeOffset = 0;
+	uint lodNodeCount = _MaxLodNodeCount;
+	uint cursorAB = 0;// swap A B TempNodeList
+	[unroll]
+	for (uint i = 0; i <= MAX_LOD; i++)
+	{
+		GroupMemoryBarrierWithGroupSync();
+		uint lod = MAX_LOD - i;
+		uint thisNodeCount = nodeCounts[i];
+		if (groupIndex < thisNodeCount)
+		{
+			cursorAB = i % 2 == 0 ? 0 : MAX_AB_SIZE;
+
+			uint2 node = nodeListAB[cursorAB + groupIndex];
+
+			int leaf = 0;
+
+			if (lod >0 && EvaluateDivideLod(node, lod))
+			{
+				uint curCount;
+				InterlockedAdd(nodeCounts[i + 1], 4, curCount);
+				uint nextIndex = (MAX_AB_SIZE - cursorAB) + curCount;
+				uint2 children = node * 2;
+				nodeListAB[nextIndex] = children;
+				nodeListAB[nextIndex + 1] = children + uint2(1u, 0u);
+				nodeListAB[nextIndex + 2] = children + uint2(0u, 1u);
+				nodeListAB[nextIndex + 3] = children + uint2(1u, 1u);
+				
+			}
+			else
+			{
+				uint curIdx;
+				InterlockedAdd(_SectorIndirectArgs[0], 1u, curIdx);
+				_FinalNodeList[curIdx] = uint3(node.x,node.y,lod);
+				leaf = 1;
+
+				// from far cry5
+				//don't use NodeCount threads to push the values into Terrain LOD MAP
+				// In the worst case one thread has to write 16x16 value!
+				/***********************************************
+				uint thisNodeSize = exp2(lod + (10 - MAX_LOD));
+				uint sectorCount = thisNodeSize / 64u;
+				uint2 sectorLoc = node * sectorCount;
+				uint wCount = sectorCount * sectorCount;
+				for (uint i = 0; i < wCount; i++)
+				{
+					_SectorLodTex[sectorLoc.xy + uint2(i % sectorCount, i / sectorCount)] = lod * 1.0 / MAX_LOD;
+				}
+				*/
+
+			} 
+
+			uint nodeId = rawNodeOffset + node.y * lodNodeCount + node.x;
+			_NodeStateList[nodeId] = leaf;
+		}
+		
+		rawNodeOffset += lodNodeCount * lodNodeCount;
+		lodNodeCount *= 2;
+	}
+
+}
+
+// Filling the Terrain LOD MAP 
+// use SectorCount threads , and pull the values from Terrain Node List
+[numthreads(8,8,1)]
+void CSBuildSectorLodTex(uint3 id :SV_DispatchThreadID)
+{
+	uint2 sectorLoc = id.xy;
+	uint rawNodeOffset = 0;
+	uint lodNodeCount = _MaxLodNodeCount;
+
+	[unroll]
+	for (uint i = 0; i <= MAX_LOD; i++)
+	{
+		uint lod = MAX_LOD - i;
+		uint sectorCount = exp2(lod); // sector count per node in this lod
+		uint2 node = sectorLoc / sectorCount;
+		uint nodeId = rawNodeOffset + node.y * lodNodeCount + node.x;
+
+		if (_NodeStateList[nodeId] == 1)
+		{
+			_SectorLodTex[sectorLoc] = lod * 1.0 / MAX_LOD;
+			return ;
+		}
+		_SectorLodTex[sectorLoc] = 0;
+
+		rawNodeOffset += lodNodeCount * lodNodeCount;
+		lodNodeCount *= 2;
+	}
+
+}
+
+float PlaneTest(float3 position, float3 extent)
+{
+	float3 minPos = position - extent;
+	float3 maxPos = position + extent;
+	float outOfRange = dot(_FrustumMinPoint > maxPos, 1) + dot(_FrustumMaxPoint < minPos, 1);
+	if (outOfRange > 0.5) return 0;
+	[unroll]
+	for (uint i = 0; i < 6; ++i)
+	{
+		float4 plane = -_Planes[i];
+		float3 absNormal = abs(plane.xyz);
+		if ((dot(position, plane.xyz) - dot(absNormal, extent)) > -plane.w)
+		{
+			return 0;
+		}
+	}
+	return 1;
+}
+
+float Cull(float3 position, float3 extent)
+{
+	if (PlaneTest(position, extent) < 0.5)
+	{
+		return 0;
+	}
+	return 1;
+}
+
+int GetLod(int2 sector)
+{
+	int maxSectorCount = _MaxLodNodeCount * exp2(MAX_LOD);
+	if (sector.x < 0 || sector.y < 0 || sector.x >= maxSectorCount || sector.y >= maxSectorCount)
+	{
+		return 0;
+	}
+	return round(_SectorLodTex[sector].r * MAX_LOD);
+}
+
+
+[numthreads(8, 8, 1)]
+void CSBuildPatches(uint3 groupID : SV_GROUPID, uint3 groupThreadId : SV_GroupThreadID)
+{
+	uint nBatchPerSector = (64 / PATCH_MESH_GRID_COUNT) / _UnitMeter; // 0.5m 8x8 1m 4x4
+
+	if (groupThreadId.x >= nBatchPerSector || groupThreadId.y >= nBatchPerSector)
+		return;
+	uint3 node = _FinalNodeList[groupID.x];
+	int lod = node.z;
+
+	//heightRange
+	uint2 patchOffet = groupThreadId.xy;
+	uint2 patch = node.xy * nBatchPerSector + patchOffet;
+	float2 heightRange = _HeightRangeTex.mips[lod][patch].xy;
+
+	//patchSize
+	float nodeSize = exp2(lod + (10 - MAX_LOD));
+	float patchSize = nodeSize / nBatchPerSector;
+
+	// bound 
+	float3 positionWS;
+	positionWS.xz = node.xy * nodeSize + _SceneOffset.xz + (patchOffet + 0.5) * patchSize;
+	positionWS.y = (heightRange.x + heightRange.y) * _TerrainHeightmapScale * 0.5 + _SceneOffset.y;
+	float3 extent;
+	extent.xz = patchSize * 0.5;
+	extent.y = (heightRange.y - heightRange.x) * _TerrainHeightmapScale * 0.5;
+	// cull
+	if (PlaneTest(positionWS, extent) < 0.5)
+		return;
+
+	// lod transition info
+	uint sectorCount = exp2(lod); // sector count per node in this lod
+	int2 sectorMin = node.xy * sectorCount;
+	int2 sectorMax = sectorMin + sectorCount-1;
+	uint4 lodTransition = uint4(0, 0, 0, 0);
+
+	
+	if (patchOffet.x == 0)
+	{
+		//left
+		lodTransition.x = max(GetLod(sectorMin + int2(-1, 0)) - lod, 0);
+	}
+	if (patchOffet.y == 0)
+	{
+		//down
+		lodTransition.y = max(GetLod(sectorMin + int2(0, -1)) - lod,0);
+	}
+	if (patchOffet.x == nBatchPerSector-1)
+	{
+		//right
+		lodTransition.z =  max(GetLod(sectorMax + int2(1, 0)) - lod, 0);
+	}
+	if (patchOffet.y == nBatchPerSector-1)
+	{ 
+		//up
+		lodTransition.w = max(GetLod(sectorMax + int2(0, 1)) - lod, 0);
+	}
+	uint lods = lodTransition.x | lodTransition.y << 4 | lodTransition.z << 8 | lodTransition.w << 12 | lod << 16;
+
+	uint curIndex;
+	InterlockedAdd(_PatchIndirectArgs[1], 1u, curIndex);
+
+	RenderPatch renderBatch;
+	renderBatch.position = positionWS.xz;
+	renderBatch.lods = lods;
+	uint2 topNode = node.xy / exp2(MAX_LOD - lod);
+	renderBatch.index = topNode.y * _MaxLodNodeCount + topNode.x;
+	_PatchRenderList[curIndex] = renderBatch;
+
+}
+
